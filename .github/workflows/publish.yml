@@ -1,0 +1,185 @@
+name: Publish sing-box build
+
+on:
+  workflow_run:
+    workflows:
+      - Build sing-box
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful build workflow run ID'
+        required: true
+        type: string
+      publish_release:
+        description: 'Publish type'
+        required: true
+        type: choice
+        options:
+          - pre-release
+          - release
+        default: pre-release
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish build ${{ inputs.build_run_id || github.event.workflow_run.id }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    env:
+      BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id }}
+      EXPECTED_WORKFLOW: .github/workflows/build.yml
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Validate build workflow run
+        id: build_run
+        uses: actions/github-script@v8
+        env:
+          EXPECTED_BRANCH: ${{ github.ref_name }}
+        with:
+          retries: 3
+          script: |
+            const { BUILD_RUN_ID, EXPECTED_BRANCH, EXPECTED_WORKFLOW } = process.env;
+            const runId = Number(BUILD_RUN_ID);
+            if (!/^[1-9][0-9]*$/.test(BUILD_RUN_ID) || !Number.isSafeInteger(runId)) {
+              throw new Error('Invalid build run ID');
+            }
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              ...context.repo, run_id: runId
+            });
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (run.repository?.full_name !== repository ||
+                run.head_repository?.full_name !== repository ||
+                run.event !== 'workflow_dispatch' || run.status !== 'completed' ||
+                run.conclusion !== 'success' || run.head_branch !== EXPECTED_BRANCH ||
+                !/^[0-9a-f]{40}$/.test(run.head_sha)) {
+              throw new Error('Build must be successful and originate from this repository and branch');
+            }
+            const { data: workflow } = await github.rest.actions.getWorkflow({
+              ...context.repo, workflow_id: run.workflow_id
+            });
+            if (workflow.path !== EXPECTED_WORKFLOW) {
+              throw new Error('Unexpected build workflow');
+            }
+            core.setOutput('head_sha', run.head_sha);
+
+      - name: Download build manifest
+        uses: actions/download-artifact@v8
+        with:
+          name: build-manifest
+          path: build-metadata
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.BUILD_RUN_ID }}
+
+      - name: Validate build manifest
+        id: manifest
+        env:
+          EXPECTED_BRANCH: ${{ github.ref_name }}
+          EXPECTED_HEAD_SHA: ${{ steps.build_run.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          manifest=build-metadata/build-manifest.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg branch "$EXPECTED_BRANCH" \
+            --arg head_sha "$EXPECTED_HEAD_SHA" \
+            --arg workflow "$EXPECTED_WORKFLOW" \
+            --argjson run_id "$BUILD_RUN_ID" \
+            '.schema_version == 2
+              and .workflow == $workflow
+              and .repository == $repository
+              and .head_branch == $branch
+              and .head_sha == $head_sha
+              and .run_id == $run_id
+              and (.version | test("^[0-9A-Za-z][0-9A-Za-z.+-]*$"))
+              and (.source_sha | test("^[0-9a-f]{40}$"))
+              and (.built_at | type == "string" and length > 0)
+              and (.artifacts | type == "array" and length > 0)
+              and ((.artifacts | map(.path) | unique | length) == (.artifacts | length))
+              and all(.artifacts[];
+                (.path | test("^[0-9A-Za-z][0-9A-Za-z._+-]*$"))
+                and (.sha256 | test("^[0-9a-f]{64}$"))
+                and (.size | type == "number" and . >= 0))' \
+            "$manifest" >/dev/null
+
+          {
+            echo "version=$(jq -r '.version' "$manifest")"
+            echo "source_sha=$(jq -r '.source_sha' "$manifest")"
+            echo "built_at=$(jq -r '.built_at' "$manifest")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: artifacts
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.BUILD_RUN_ID }}
+
+      - name: Verify artifact files
+        run: |
+          set -euo pipefail
+          jq -S '.artifacts | sort_by(.path)' \
+            build-metadata/build-manifest.json > expected-artifacts.json
+
+          {
+            while IFS= read -r -d '' file; do
+              relative_path=${file#artifacts/}
+              sha256=$(sha256sum "$file" | awk '{print $1}')
+              size=$(stat -c '%s' "$file")
+              jq -nc \
+                --arg path "$relative_path" \
+                --arg sha256 "$sha256" \
+                --argjson size "$size" \
+                '{path: $path, sha256: $sha256, size: $size}'
+            done < <(find artifacts -type f -print0 | sort -z)
+          } | jq -s -S 'sort_by(.path)' > actual-artifacts.json
+
+          diff -u expected-artifacts.json actual-artifacts.json
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+          SOURCE_SHA: ${{ steps.manifest.outputs.source_sha }}
+          BUILT_AT: ${{ steps.manifest.outputs.built_at }}
+        run: |
+          set -euo pipefail
+          published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "## sing-box v${VERSION}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| sing-box Commit | [\`${SOURCE_SHA}\`](https://github.com/reF1nd/sing-box/commit/${SOURCE_SHA}) |"
+            echo "| Built At | ${BUILT_AT} |"
+            echo "| Published At | ${published_at} |"
+            echo "| Build Run ID | [${BUILD_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}) |"
+            echo "| Publish Run ID | [${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+          } > release-notes.md
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.manifest.outputs.version }}
+          name: v${{ steps.manifest.outputs.version }}
+          prerelease: ${{ github.event_name == 'workflow_run' || inputs.publish_release == 'pre-release' }}
+          repository: ${{ github.repository }}
+          target_commitish: ${{ steps.build_run.outputs.head_sha }}
+          body_path: release-notes.md
+          files: artifacts/*
+          overwrite_files: true
+          fail_on_unmatched_files: true

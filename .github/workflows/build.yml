@@ -1,0 +1,456 @@
+name: Build sing-box
+run-name: Build CLI ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without v (also used when building a commit, e.g. 1.13.0-rc.4)'
+        required: true
+      commit_hash:
+        description: 'Optional commit hash to build from (overrides version tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26.8'
+
+jobs:
+  resolve_source:
+    name: Resolve sing-box source
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.checkout.outputs.commit }}
+    steps:
+      - name: Validate version
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "invalid version: $INPUT_VERSION" >&2
+            exit 1
+          fi
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+
+      - name: Checkout sing-box
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          repository: reF1nd/sing-box
+          ref: ${{ inputs.commit_hash || format('v{0}', inputs.version) }}
+          path: sing-box
+          persist-credentials: false
+
+  build_cli:
+    name: Build CLI ${{ matrix.platform }}-${{ matrix.arch }} ${{ matrix.variant }}
+    runs-on: ${{ matrix.os }}
+    needs: resolve_source
+    strategy:
+      fail-fast: false
+      max-parallel: 13
+      matrix:
+        include:
+          - platform: linux
+            arch: arm64
+            os: ubuntu-26.04
+            goarch: arm64
+            goamd64: ''
+            binary: sing-box
+            variant: purego
+            artifact_name: binary-linux-arm64-purego
+          - platform: linux
+            arch: arm64
+            os: ubuntu-26.04
+            goarch: arm64
+            goamd64: ''
+            binary: sing-box
+            variant: glibc
+            artifact_name: binary-linux-arm64-glibc
+            cgo: '1'
+          - platform: linux
+            arch: arm64
+            os: ubuntu-26.04
+            goarch: arm64
+            goamd64: ''
+            binary: sing-box
+            variant: musl
+            artifact_name: binary-linux-arm64-musl
+            cgo: '1'
+          - platform: linux
+            arch: amd64
+            os: ubuntu-26.04
+            goarch: amd64
+            goamd64: v1
+            binary: sing-box
+            variant: purego
+            artifact_name: binary-linux-amd64-purego
+          - platform: linux
+            arch: amd64
+            os: ubuntu-26.04
+            goarch: amd64
+            goamd64: v1
+            binary: sing-box
+            variant: glibc
+            artifact_name: binary-linux-amd64-glibc
+            cgo: '1'
+          - platform: linux
+            arch: amd64
+            os: ubuntu-26.04
+            goarch: amd64
+            goamd64: v1
+            binary: sing-box
+            variant: musl
+            artifact_name: binary-linux-amd64-musl
+            cgo: '1'
+          - platform: linux
+            arch: amd64v3
+            os: ubuntu-26.04
+            goarch: amd64
+            goamd64: v3
+            binary: sing-box
+            variant: purego
+            artifact_name: binary-linux-amd64v3-purego
+          - platform: linux
+            arch: amd64v3
+            os: ubuntu-26.04
+            goarch: amd64
+            goamd64: v3
+            binary: sing-box
+            variant: glibc
+            artifact_name: binary-linux-amd64v3-glibc
+            cgo: '1'
+          - platform: linux
+            arch: amd64v3
+            os: ubuntu-26.04
+            goarch: amd64
+            goamd64: v3
+            binary: sing-box
+            variant: musl
+            artifact_name: binary-linux-amd64v3-musl
+            cgo: '1'
+          - platform: windows
+            arch: arm64
+            os: windows-latest
+            goarch: arm64
+            goamd64: ''
+            binary: sing-box.exe
+            variant: purego
+            artifact_name: binary-windows-arm64
+          - platform: windows
+            arch: amd64
+            os: windows-latest
+            goarch: amd64
+            goamd64: v1
+            binary: sing-box.exe
+            variant: purego
+            artifact_name: binary-windows-amd64
+          - platform: windows
+            arch: amd64v3
+            os: windows-latest
+            goarch: amd64
+            goamd64: v3
+            binary: sing-box.exe
+            variant: purego
+            artifact_name: binary-windows-amd64v3
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          repository: reF1nd/sing-box
+          ref: ${{ needs.resolve_source.outputs.source_sha }}
+          path: sing-box
+          persist-credentials: false
+
+      - name: Restore Go modules for Linux
+        if: matrix.platform == 'linux'
+        id: cli-go-mod
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('sing-box/go.sum') }}
+          restore-keys: go-mod-linux-
+
+      - name: Cache Go modules for Windows
+        if: matrix.platform == 'windows'
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-windows-${{ hashFiles('sing-box/go.sum') }}
+          restore-keys: go-mod-windows-
+
+      - name: Read Cronet version
+        id: cronet
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\r' < sing-box/.github/CRONET_GO_VERSION)
+          [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._/-]*$ ]] || { echo 'Invalid Cronet ref' >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Cronet toolchain sources
+        if: matrix.variant == 'glibc' || matrix.variant == 'musl'
+        uses: actions/checkout@v6
+        with:
+          repository: sagernet/cronet-go
+          ref: ${{ steps.cronet.outputs.version }}
+          path: cronet-go
+          sparse-checkout: |
+            /*
+            !/lib
+          sparse-checkout-cone-mode: false
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Regenerate Debian keyring
+        if: matrix.variant == 'glibc' || matrix.variant == 'musl'
+        shell: bash
+        run: |
+          set -xeuo pipefail
+          cd cronet-go
+          rm -f naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Download Chromium toolchain
+        if: matrix.variant == 'glibc' || matrix.variant == 'musl'
+        shell: bash
+        working-directory: cronet-go
+        run: |
+          set -xeuo pipefail
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} --libc=musl download-toolchain
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} download-toolchain
+          fi
+
+      - name: Set Chromium toolchain environment
+        if: matrix.variant == 'glibc' || matrix.variant == 'musl'
+        shell: bash
+        working-directory: cronet-go
+        run: |
+          set -xeuo pipefail
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} --libc=musl env >> "$GITHUB_ENV"
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} env >> "$GITHUB_ENV"
+          fi
+
+      - name: Compute build environment
+        id: env
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_WINDOWS)
+          else
+            TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS)
+          fi
+          if [[ "${TAGS}" != *with_naive_outbound* ]]; then
+            TAGS="${TAGS},with_naive_outbound"
+          fi
+          if [[ -f sing-box/include/ebpf.go && "${{ matrix.platform }}" == "linux" && "${TAGS}" != *with_ebpf* ]]; then
+            TAGS="${TAGS},with_ebpf"
+          fi
+          ARCHIVE_SUFFIX=""
+
+          case "${{ matrix.variant }}" in
+            'purego')
+              if [[ "${TAGS}" != *with_purego* ]]; then
+                TAGS="${TAGS},with_purego"
+              fi
+              ;;
+            'glibc')
+              ARCHIVE_SUFFIX="-glibc"
+              ;;
+            'musl')
+              TAGS="${TAGS},with_musl"
+              ARCHIVE_SUFFIX="-musl"
+              ;;
+          esac
+          if [[ "${{ matrix.variant }}" == "purego" && "${{ matrix.platform }}" == "linux" ]]; then
+              ARCHIVE_SUFFIX="-purego"
+          fi
+
+          TAGS="${TAGS},with_v2ray_api"
+          {
+            echo "tags=${TAGS}"
+            echo "ldflags=$(cat sing-box/release/LDFLAGS)"
+            echo "archive_suffix=${ARCHIVE_SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "--- Build Environment ---"
+          echo "Platform: ${{ matrix.platform }}"
+          echo "Arch: ${{ matrix.arch }}"
+          echo "Tags: ${TAGS}"
+          echo "Archive suffix: ${ARCHIVE_SUFFIX}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -xeuo pipefail
+          cd sing-box
+          mkdir -p dist
+          go build -v -trimpath -o "dist/${{ matrix.binary }}" \
+            -tags "${{ steps.env.outputs.tags }}" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }} ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+        env:
+          LDFLAGS_SHARED: ${{ steps.env.outputs.ldflags }}
+          CGO_ENABLED: ${{ matrix.cgo || '0' }}
+          GOOS: ${{ matrix.platform }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+
+      - name: Checkout Cronet shared library
+        if: matrix.variant == 'purego'
+        uses: actions/checkout@v6
+        with:
+          repository: sagernet/cronet-go
+          ref: ${{ steps.cronet.outputs.version }}
+          path: cronet-go-lib
+          sparse-checkout: /lib/${{ matrix.platform }}_${{ matrix.goarch }}/libcronet.${{ matrix.platform == 'windows' && 'dll' || 'so' }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Copy Cronet shared library
+        if: matrix.variant == 'purego'
+        shell: bash
+        run: cp "cronet-go-lib/lib/${{ matrix.platform }}_${{ matrix.goarch }}/libcronet.${{ matrix.platform == 'windows' && 'dll' || 'so' }}" sing-box/dist/
+
+      - name: Archive (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sing-box/dist
+          DIR_NAME="sing-box-${{ inputs.version }}-${{ matrix.platform }}-${{ matrix.arch }}${{ steps.env.outputs.archive_suffix }}"
+          mkdir -p "$DIR_NAME"
+          cp ../LICENSE sing-box "$DIR_NAME/"
+          if [[ -f libcronet.so ]]; then
+            cp libcronet.so "$DIR_NAME/"
+          fi
+          tar -czvf "$DIR_NAME.tar.gz" "$DIR_NAME"
+          rm -rf "$DIR_NAME" sing-box
+          rm -f libcronet.so
+
+      - name: Archive (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cd sing-box/dist
+          $DIR_NAME = "sing-box-${{ github.event.inputs.version }}-windows-${{ matrix.arch }}"
+          mkdir "$DIR_NAME"
+          Copy-Item ../LICENSE "$DIR_NAME/"
+          Copy-Item sing-box.exe "$DIR_NAME/"
+          if (Test-Path libcronet.dll) {
+              Copy-Item libcronet.dll "$DIR_NAME/"
+          }
+          Compress-Archive -Path "$DIR_NAME" -DestinationPath "$DIR_NAME.zip"
+          Remove-Item -Recurse "$DIR_NAME"
+          Remove-Item sing-box.exe
+          if (Test-Path libcronet.dll) { Remove-Item libcronet.dll }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: sing-box/dist/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save shared CLI Go modules
+        if: matrix.artifact_name == 'binary-linux-amd64-purego' && steps.cli-go-mod.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ steps.cli-go-mod.outputs.cache-primary-key }}
+
+  finalize_build:
+    name: Finalize build artifacts
+    runs-on: ubuntu-latest
+    needs: [resolve_source, build_cli]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate build manifest
+        run: |
+          set -euo pipefail
+          {
+            while IFS= read -r -d '' file; do
+              relative_path=${file#artifacts/}
+              sha256=$(sha256sum "$file" | awk '{print $1}')
+              size=$(stat -c '%s' "$file")
+              jq -nc \
+                --arg path "$relative_path" \
+                --arg sha256 "$sha256" \
+                --argjson size "$size" \
+                '{path: $path, sha256: $sha256, size: $size}'
+            done < <(find artifacts -type f -print0 | sort -z)
+          } | jq -s 'sort_by(.path)' > artifact-files.json
+
+          jq -n \
+            --arg workflow '.github/workflows/build.yml' \
+            --arg repository "${{ github.repository }}" \
+            --arg head_branch "${{ github.ref_name }}" \
+            --arg head_sha "${{ github.sha }}" \
+            --arg version "${{ inputs.version }}" \
+            --arg source_sha "${{ needs.resolve_source.outputs.source_sha }}" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson run_id "${{ github.run_id }}" \
+            --argjson run_attempt "${{ github.run_attempt }}" \
+            --slurpfile artifact_files artifact-files.json \
+            '{
+              schema_version: 2,
+              workflow: $workflow,
+              repository: $repository,
+              head_branch: $head_branch,
+              head_sha: $head_sha,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              version: $version,
+              source_sha: $source_sha,
+              built_at: $built_at,
+              artifacts: $artifact_files[0]
+            }' > build-manifest.json
+
+          jq -e '.artifacts | length > 0' build-manifest.json >/dev/null
+          cat build-manifest.json
+
+      - name: Attest build provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            artifacts/**
+            build-manifest.json
+
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-manifest
+          path: build-manifest.json
+          if-no-files-found: error
+          retention-days: 30
