@@ -1,9 +1,9 @@
-name: Publish sing-box build
+name: Publish build
 
 on:
   workflow_run:
     workflows:
-      - Build sing-box
+      - Build
     types: [completed]
   workflow_dispatch:
     inputs:

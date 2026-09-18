@@ -1,5 +1,4 @@
-name: Build sing-box
-run-name: Build CLI ${{ inputs.version }}
+name: Build
 
 on:
   workflow_dispatch:
