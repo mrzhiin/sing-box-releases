@@ -43,7 +43,7 @@ jobs:
 
       - name: Checkout sing-box
         id: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: reF1nd/sing-box
           ref: ${{ inputs.commit_hash || inputs.version }}
@@ -162,13 +162,13 @@ jobs:
             artifact_name: binary-windows-amd64v3
     steps:
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
       - name: Checkout sing-box
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: reF1nd/sing-box
           ref: ${{ needs.resolve_source.outputs.source_sha }}
@@ -178,7 +178,7 @@ jobs:
       - name: Restore Go modules for Linux
         if: matrix.platform == 'linux'
         id: cli-go-mod
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('sing-box/go.sum') }}
@@ -186,7 +186,7 @@ jobs:
 
       - name: Cache Go modules for Windows
         if: matrix.platform == 'windows'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/go/pkg/mod
           key: go-mod-windows-${{ hashFiles('sing-box/go.sum') }}
@@ -203,7 +203,7 @@ jobs:
 
       - name: Checkout Cronet toolchain sources
         if: matrix.variant == 'glibc' || matrix.variant == 'musl'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: sagernet/cronet-go
           ref: ${{ steps.cronet.outputs.version }}
@@ -316,7 +316,7 @@ jobs:
 
       - name: Checkout Cronet shared library
         if: matrix.variant == 'purego'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: sagernet/cronet-go
           ref: ${{ steps.cronet.outputs.version }}
@@ -374,7 +374,7 @@ jobs:
 
       - name: Save shared CLI Go modules
         if: matrix.artifact_name == 'binary-linux-amd64-purego' && steps.cli-go-mod.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: ~/go/pkg/mod
           key: ${{ steps.cli-go-mod.outputs.cache-primary-key }}
@@ -442,7 +442,7 @@ jobs:
           cat build-manifest.json
 
       - name: Attest build provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@v4
         with:
           subject-path: |
             artifacts/**
