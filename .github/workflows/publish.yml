@@ -11,14 +11,6 @@ on:
         description: 'Successful build workflow run ID'
         required: true
         type: string
-      publish_release:
-        description: 'Publish type'
-        required: true
-        type: choice
-        options:
-          - pre-release
-          - release
-        default: pre-release
 
 concurrency:
   group: publish-release
@@ -34,6 +26,9 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository &&
        github.event.workflow_run.head_branch == github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.manifest.outputs.version }}
+      source_sha: ${{ steps.manifest.outputs.source_sha }}
     env:
       BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id }}
       EXPECTED_WORKFLOW: .github/workflows/build.yml
@@ -150,6 +145,16 @@ jobs:
 
           diff -u expected-artifacts.json actual-artifacts.json
 
+      - name: Upload verified container binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-binaries
+          path: |
+            artifacts/sing-box-${{ steps.manifest.outputs.version }}-linux-amd64-glibc.tar.gz
+            artifacts/sing-box-${{ steps.manifest.outputs.version }}-linux-arm64-glibc.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Generate release notes
         env:
           VERSION: ${{ steps.manifest.outputs.version }}
@@ -176,10 +181,22 @@ jobs:
         with:
           tag_name: v${{ steps.manifest.outputs.version }}
           name: v${{ steps.manifest.outputs.version }}
-          prerelease: ${{ github.event_name == 'workflow_run' || inputs.publish_release == 'pre-release' }}
+          prerelease: false
           repository: ${{ github.repository }}
           target_commitish: ${{ steps.build_run.outputs.head_sha }}
           body_path: release-notes.md
           files: artifacts/*
           overwrite_files: true
           fail_on_unmatched_files: true
+
+  docker:
+    name: Publish container image
+    needs: publish
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+      source_sha: ${{ needs.publish.outputs.source_sha }}

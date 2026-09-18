@@ -1,0 +1,94 @@
+name: Publish Docker Images
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Validated build manifest version without v'
+        required: true
+        type: string
+      source_sha:
+        description: 'Validated sing-box source commit'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    name: Build and push multi-platform image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout image definition
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare image metadata
+        id: meta
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          # Docker tags cannot contain '+', even though version strings can.
+          [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag="v${VERSION//+/_}"
+          [[ ${#tag} -le 128 ]]
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download verified container binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: container-binaries
+          path: artifacts
+
+      - name: Prepare container build context
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            directory="sing-box-${VERSION}-linux-${arch}-glibc"
+            mkdir -p "context/$arch"
+            tar -xzf "artifacts/$directory.tar.gz" -C "context/$arch" \
+              --strip-components=1 --no-same-owner \
+              "$directory/sing-box" "$directory/LICENSE"
+            chmod +x "context/$arch/sing-box"
+          done
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: context
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ inputs.source_sha }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
