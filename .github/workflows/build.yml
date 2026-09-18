@@ -56,7 +56,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     needs: resolve_source
     strategy:
-      fail-fast: false
       max-parallel: 13
       matrix:
         include:

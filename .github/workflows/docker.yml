@@ -1,56 +1,101 @@
 name: Publish Docker Images
 
 on:
-  workflow_call:
+  release:
+    types: [released]
+  workflow_dispatch:
     inputs:
-      version:
-        description: 'Validated build manifest version without v'
-        required: true
-        type: string
-      source_sha:
-        description: 'Validated sing-box source commit'
+      release_tag:
+        description: 'Full tag of a stable release, e.g. v1.14.1-reF1nd'
         required: true
         type: string
 
+concurrency:
+  group: publish-docker
+  cancel-in-progress: false
+
 permissions:
-  actions: read
   contents: read
   packages: write
 
 jobs:
   docker:
     name: Build and push multi-platform image
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.release.prerelease == false && github.event.release.draft == false)
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
     steps:
       - name: Checkout image definition
         uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - name: Prepare image metadata
+      - name: Download and validate release manifest
         id: meta
         env:
-          VERSION: ${{ inputs.version }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Docker tags cannot contain '+', even though version strings can.
-          [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          tag="v${VERSION//+/_}"
-          [[ ${#tag} -le 128 ]]
-          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease | jq -e '.isDraft == false and .isPrerelease == false' >/dev/null || {
+              echo 'Release must exist and be published as a stable release (not draft or pre-release)' >&2
+              exit 1
+            }
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern build-manifest.json --dir metadata
+          jq -e --arg repository "$GITHUB_REPOSITORY" --arg tag "$RELEASE_TAG" '
+            .schema_version == 2
+            and .repository == $repository
+            and .workflow == ".github/workflows/build.yml"
+            and (.version | test("^[0-9A-Za-z][0-9A-Za-z.+-]*$"))
+            and ("v" + .version == $tag)
+            and (.source_sha | test("^[0-9a-f]{40}$"))
+            and (.artifacts | type == "array")
+          ' metadata/build-manifest.json >/dev/null
+          [[ ${#RELEASE_TAG} -le 128 ]]
+          {
+            echo "version=$(jq -r '.version' metadata/build-manifest.json)"
+            echo "source_sha=$(jq -r '.source_sha' metadata/build-manifest.json)"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Download verified container binaries
-        uses: actions/download-artifact@v8
+      - name: Docker metadata
+        id: docker_meta
+        uses: docker/metadata-action@v5
         with:
-          name: container-binaries
-          path: artifacts
+          images: ghcr.io/${{ github.repository_owner }}/sing-box
+          tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
+
+      - name: Download and verify release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            file="sing-box-${VERSION}-linux-${arch}-glibc.tar.gz"
+            sha256=$(jq -er --arg path "$file" '
+              [.artifacts[] | select(.path == $path)]
+              | select(length == 1) | .[0].sha256
+              | select(test("^[0-9a-f]{64}$"))
+            ' metadata/build-manifest.json)
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$file" --dir artifacts
+            printf '%s  %s\n' "$sha256" "artifacts/$file" | sha256sum --check --strict
+          done
 
       - name: Prepare container build context
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
@@ -84,11 +129,5 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.image }}:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ inputs.version }}
-            org.opencontainers.image.revision=${{ inputs.source_sha }}
-            org.opencontainers.image.licenses=GPL-3.0-or-later
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
